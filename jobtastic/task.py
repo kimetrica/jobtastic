@@ -58,32 +58,41 @@ from jobtastic.states import PROGRESS  # NOQA
 
 
 @contextmanager
-def acquire_lock(lock_name):
+def acquire_lock(lock_name, timeout=900):
     """
     A contextmanager to wait until an exclusive lock is available,
     hold the lock and then release it when the code under context
     is complete.
 
-    TODO: This code doesn't work like it should. It doesn't
-    wait indefinitely for the lock and in fact cycles through
-    very quickly.
+    Attempt to use lock and unlock, which will work if the Cache is Redis,
+    but fall back to a memcached-compliant add/delete approach.
+
+    See:
+    - http://loose-bits.com/2010/10/distributed-task-locking-in-celery.html
+    - http://celery.readthedocs.org/en/latest/tutorials/task-cookbook.html#ensuring-a-task-is-only-executed-one-at-a-time  # NOQA
+
     """
-    for _ in range(10):
+    try:
+        redis = cache.client.client
+        have_lock = False
+        lock = redis.lock(lock_name, timeout=timeout)
         try:
-            value = cache.incr(lock_name)
-        except ValueError:
-            cache.set(lock_name, 0)
-            value = cache.incr(lock_name)
-        if value == 1:
-            break
-        else:
-            cache.decr(lock_name)
-    else:
-        yield
-        cache.set(lock_name, 0)
-        return
-    yield
-    cache.decr(lock_name)
+            have_lock = lock.acquire(blocking=True)
+            if have_lock:
+                yield
+        finally:
+            if have_lock:
+                lock.release()
+    except AttributeError:
+        have_lock = False
+        try:
+            while not have_lock:
+                have_lock = cache.add(lock_name, 'locked', timeout)
+            if have_lock:
+                yield
+        finally:
+            if have_lock:
+                cache.delete(lock_name)
 
 
 class JobtasticTask(Task):
