@@ -11,88 +11,23 @@ import time
 import os
 import sys
 import warnings
-from contextlib import contextmanager
 from hashlib import md5
 
 import psutil
 
 from celery.datastructures import ExceptionInfo
+from celery.five import class_property
 from celery.states import PENDING, SUCCESS
 from celery.task import Task
 from celery.utils import gen_unique_id
+from jobtastic.cache import get_cache
+from jobtastic.states import PROGRESS  # NOQA
 
 get_task_logger = None
 try:
     from celery.utils.log import get_task_logger
 except ImportError:
     pass  # get_task_logger is new in Celery 3.X
-
-cache = None
-try:
-    # For now, let's just say that if Django exists, we should use it.
-    # Otherwise, try Flask. This definitely needs an actual configuration
-    # variable so folks can make an explicit decision.
-    from django.core.cache import cache
-    HAS_DJANGO = True
-except ImportError:
-    try:
-        # We should really have an explicitly-defined way of doing this, but
-        # for now, let's just use werkzeug Memcached if it exists
-        from werkzeug.contrib.cache import MemcachedCache
-
-        from celery import conf
-        if conf.CELERY_RESULT_BACKEND == 'cache':
-            uri_str = conf.CELERY_CACHE_BACKEND.strip('memcached://')
-            uris = uri_str.split(';')
-            cache = MemcachedCache(uris)
-            HAS_WERKZEUG = True
-    except ImportError:
-        pass
-
-if cache is None:
-    raise Exception(
-        "Jobtastic requires either Django or Flask + Memcached result backend")
-
-
-from jobtastic.states import PROGRESS  # NOQA
-
-
-@contextmanager
-def acquire_lock(lock_name, timeout=900):
-    """
-    A contextmanager to wait until an exclusive lock is available,
-    hold the lock and then release it when the code under context
-    is complete.
-
-    Attempt to use lock and unlock, which will work if the Cache is Redis,
-    but fall back to a memcached-compliant add/delete approach.
-
-    See:
-    - http://loose-bits.com/2010/10/distributed-task-locking-in-celery.html
-    - http://celery.readthedocs.org/en/latest/tutorials/task-cookbook.html#ensuring-a-task-is-only-executed-one-at-a-time  # NOQA
-
-    """
-    try:
-        redis = cache.client.client
-        have_lock = False
-        lock = redis.lock(lock_name, timeout=timeout)
-        try:
-            have_lock = lock.acquire(blocking=True)
-            if have_lock:
-                yield
-        finally:
-            if have_lock:
-                lock.release()
-    except AttributeError:
-        have_lock = False
-        try:
-            while not have_lock:
-                have_lock = cache.add(lock_name, 'locked', timeout)
-            if have_lock:
-                yield
-        finally:
-            if have_lock:
-                cache.delete(lock_name)
 
 
 class JobtasticTask(Task):
@@ -144,6 +79,9 @@ class JobtasticTask(Task):
       front-end code so that users know what to expect.
     """
     abstract = True
+
+    #: The shared cache used for locking and thundering herd protection
+    _cache = None
 
     @classmethod
     def delay_or_eager(self, *args, **kwargs):
@@ -239,7 +177,7 @@ class JobtasticTask(Task):
         cache_key = self._get_cache_key(**kwargs)
 
         # Check for an already-computed and cached result
-        task_id = cache.get(cache_key)  # Check for the cached result
+        task_id = self.cache.get(cache_key)  # Check for the cached result
         if task_id:
             # We've already built this result, just latch on to the task that
             # did the work
@@ -248,7 +186,7 @@ class JobtasticTask(Task):
             return self.AsyncResult(task_id)
 
         # Check for an in-progress equivalent task to avoid duplicating work
-        task_id = cache.get('herd:%s' % cache_key)
+        task_id = self.cache.get('herd:%s' % cache_key)
         if task_id:
             logging.info('Found existing in-progress task: %s', task_id)
             return self.AsyncResult(task_id)
@@ -256,7 +194,7 @@ class JobtasticTask(Task):
         # It's not cached and it's not already running. Use an atomic lock to
         # start the task, ensuring there isn't a race condition that could
         # result in multiple identical tasks being fired at once.
-        with acquire_lock('lock:%s' % cache_key):
+        with self.cache.lock('lock:%s' % cache_key):
             task_meta = super(JobtasticTask, self).apply_async(
                 args,
                 kwargs,
@@ -264,7 +202,7 @@ class JobtasticTask(Task):
             )
             logging.info('Current status: %s', task_meta.status)
             if task_meta.status in (PROGRESS, PENDING):
-                cache.set(
+                self.cache.set(
                     'herd:%s' % cache_key,
                     task_meta.task_id,
                     timeout=self.herd_avoidance_timeout)
@@ -381,7 +319,7 @@ class JobtasticTask(Task):
             cache_duration = -1  # By default, don't cache
         if cache_duration >= 0:
             # If we're configured to cache this result, do so.
-            cache.set(self.cache_key, self.request.id, cache_duration)
+            self.cache.set(self.cache_key, self.request.id, cache_duration)
 
         # Now that the task is finished, we can stop all of the thundering herd
         # avoidance
@@ -428,7 +366,28 @@ class JobtasticTask(Task):
             self.update_state(task_id, SUCCESS, retval)
 
     def _break_thundering_herd_cache(self):
-        cache.delete('herd:%s' % self.cache_key)
+        self.cache.delete('herd:%s' % self.cache_key)
+
+    @classmethod
+    def _get_cache(self):
+        """
+        Return the cache to use for thundering herd protection, etc.
+        """
+        if not self._cache:
+            self._cache = get_cache(self.app)
+        return self._cache
+
+    @classmethod
+    def _set_cache(self, cache):
+        """
+        Set the Jobtastic Cache for the Task
+
+        The cache must support get/set (with timeout)/delete/lock (as a context
+        manager).
+        """
+        self._cache = cache
+
+    cache = class_property(_get_cache, _set_cache)
 
     @classmethod
     def _get_cache_key(self, **kwargs):
